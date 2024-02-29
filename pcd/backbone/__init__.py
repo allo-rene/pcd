@@ -1,8 +1,8 @@
 import copy
 import torch
 
-import resnet
-import mobilenetv3
+from .resnet import resnet18, resnet34
+from .mobilenetv3 import mobilenetv3_large
 
 
 def build_student_backbone(arch, flatten=False):
@@ -12,11 +12,11 @@ def build_student_backbone(arch, flatten=False):
     :param flatten: if using flatten operation to get vectorized feature
     """
     if arch == "resnet18":
-        backbone = resnet.resnet18(flatten=flatten)
+        backbone = resnet18(flatten=flatten)
     elif arch == "resnet34":
-        backbone = resnet.resnet34(flatten=flatten)
+        backbone = resnet34(flatten=flatten)
     elif arch == "mobilenetv3_large":
-        backbone = mobilenetv3.mobilenetv3_large(flatten=flatten)
+        backbone = mobilenetv3_large(flatten=flatten)
     else:
         raise ValueError(f"Please add other student model as you like.")
 
