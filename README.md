@@ -16,6 +16,24 @@ This is a PyTorch implementation of the [PCD paper](https://arxiv.org/abs/2211.0
 ## Preparation
 
 ## Distillation
+For single node distributed training:
 ```
-python main_pcd.py {dataset_dir} --student-arch resnet18 --teacher-arch mocov3_r50 --teacher-ckpt {checkpoint_path_of_teacher_model} 
+python main_pcd.py {dataset_dir} --rank 0 --world-size 1 -md \
+  --student-arch resnet18 --teacher-arch mocov3_r50 \
+  --teacher-ckpt {checkpoint_path_of_teacher_model} --output-dir {output_dir}
 ```
+
+For multi nodes distributed training:
+```
+# For main node
+python main_pcd.py {dataset_dir} --rank 0 --world-size {number_of_nodes} -md \
+  --student-arch resnet18 --teacher-arch mocov3_r50 \
+  --teacher-ckpt {checkpoint_path_of_teacher_model} --output-dir {output_dir}
+
+# For other nodes
+python main_pcd.py {dataset_dir} --rank {index_of_current_node} --world-size {number_of_nodes} -md \
+  --dist-url {ip_of_main_node} --student-arch resnet18 --teacher-arch mocov3_r50 \
+  --teacher-ckpt {checkpoint_path_of_teacher_model} --output-dir {output_dir}
+```
+
+## Models
