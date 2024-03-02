@@ -1,10 +1,8 @@
 #!/usr/bin/env python
 
 import os
-import math
 import time
 import random
-import shutil
 import argparse
 import builtins
 import warnings
@@ -21,52 +19,49 @@ import torch.utils.data.distributed
 import torchvision.datasets as datasets
 
 import pcd
-from utils import reduce_tensor_mean, AvgMeter, save_checkpoint, adjust_learning_rate, cal_eta_time
+from pcd import reduce_tensor_mean, AvgMeter, save_checkpoint, adjust_learning_rate, cal_eta_time
 
 
 parser = argparse.ArgumentParser(description="PCD Training on ImageNet")
 # data
-parser.add_argument("--data", metavar="DIR", help="path to dataset")
+parser.add_argument("data", metavar="DIR", help="path to dataset")
 parser.add_argument("-j", "--workers", default=32, type=int, help="number of data loading workers")
-parser.add_argument("-b", "--batch-size", default=256, type=int, metavar="N", help="mini-batch size (default: 256)")
+parser.add_argument("-b", "--batch-size", default=1024, type=int, metavar="N", help="mini-batch size (default: 256)")
 
 # model
-parser.add_argument("--student-arch", default=None, type=str)
-parser.add_argument("--teacher-arch", default=None, type=str, help="The architecture of teacher model.")
+parser.add_argument("-sa", "--student-arch", default=None, type=str, help="The architecture of student model.")
+parser.add_argument("-ta", "--teacher-arch", default=None, type=str, help="The architecture of teacher model.")
 parser.add_argument("--teacher-ckpt", default=None, type=str, help="The path storing teacher checkpoint.")
 parser.add_argument("-qs", "--queue-size", default=65536, type=int, help="The size the queue storing negative features.")
 parser.add_argument("-tau", "--temperature", default=0.2, type=float)
 
 # optimizer
-parser.add_argument("--optimizer", type=str, default="SGD")
+parser.add_argument("--optimizer", type=str, default="LARS", help="choice of optimizer")
 parser.add_argument("--start-epoch", default=0, type=int, help="current epoch")
 parser.add_argument("--total-epochs", default=100, type=int, help="number of total epochs to run")
-parser.add_argument("-lr", "--learning-rate", default=0.03, type=float, help="initial learning rate")
-parser.add_argument("--wd", "--weight-decay", default=1e-4, type=float, help="weight decay (default: 1e-4)")
-parser.add_argument("--momentum", default=0.9, type=float)
-parser.add_argument("--nesterov", action="store_true", default=False)
-parser.add_argument("--lr-decay-strategy", default=None, type=str, help="The strategy for learning rate decaying.")
+parser.add_argument("-lr", "--learning-rate", default=1.0, type=float, help="initial learning rate")
+parser.add_argument("-wd", "--weight-decay", default=0.00001, type=float, help="weight decay")
+parser.add_argument("--momentum", default=0.9, type=float, help="momentum of optimization")
+parser.add_argument("--nesterov", action="store_true", default=False, help="whether to use nesterov")
+parser.add_argument("--lr-decay-strategy", default="warmcos", type=str, help="strategy for learning rate decaying.")
+parser.add_argument("--warmup-epochs", default=10, type=int, help="numter of warmup epochs")
 parser.add_argument("-p", "--print-freq", default=10, type=int, help="print frequency (default: 10)")
 
 # others
-parser.add_argument("--resume", default=None, type=str,metavar="PATH", help="path to latest checkpoint (default: None)")
+parser.add_argument("--resume", default=None, type=str, metavar="PATH", help="path to latest checkpoint (default: None)")
 parser.add_argument("--seed", default=None, type=int, help="seed for initializing training.")
 
 # distributed
 parser.add_argument("--world-size", default=-1, type=int, help="number of nodes for distributed training")
 parser.add_argument("--rank", default=-1, type=int, help="node rank for distributed training")
-parser.add_argument("--dist-url", default="tcp://224.66.41.62:23456", type=str,
-                    help="url used to set up distributed training")
+parser.add_argument("--dist-url", default="tcp://localhost:23456", type=str, help="url used to set up distributed training")
 parser.add_argument("--dist-backend", default="nccl", type=str, help="distributed backend")
 parser.add_argument("--gpu", default=None, type=int, help="GPU id to use.")
-parser.add_argument(
-    "--multiprocessing-distributed",
-    action="store_true",
-    help="Use multi-processing distributed training to launch "
-    "N processes per node, which has N GPUs. This is the "
-    "fastest way to use PyTorch for either single node or "
-    "multi node data parallel training",
-)
+parser.add_argument("-md", "--multiprocessing-distributed", action="store_true",
+                    help="Use multi-processing distributed training to launch "
+                    "N processes per node, which has N GPUs. This is the "
+                    "fastest way to use PyTorch for either single node or "
+                    "multi node data parallel training")
 
 
 def main():
@@ -196,8 +191,9 @@ def main_worker(gpu, ngpus_per_node, args):
         raise NotImplementedError("Only DistributedDataParallel is supported.")
 
     # optimizer
+    args.base_lr = args.learning_rate * (args.batch_size // 256)  # learning rate scaling rule
     optimizer_kwargs = {
-        "lr": args.lr if "warm" not in args.lr_decay_strategy else 1e-6,
+        "lr": args.base_lr if "warm" not in args.lr_decay_strategy else 1e-6,
         "weight_decay": args.weight_decay,
         "momentum": args.momentum,
         "nesterov": args.nesterov,
@@ -222,17 +218,16 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             print(f"=> no checkpoint found at '{args.resume}'")
 
-    # learning rate scaling rule
-    args.base_lr = args.lr * (args.batch_size // 256)
-
     # training
-    for epoch in range(args.start_epoch, args.epochs):
+    args.mtr_dt = None  # dict for storing AvgMeter
+    for epoch in range(args.start_epoch, args.total_epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
         train(args, train_loader, model, optimizer, epoch)
 
+        # save
         if not args.multiprocessing_distributed or (
             args.multiprocessing_distributed and args.rank % ngpus_per_node == 0
         ):
@@ -254,17 +249,22 @@ def train(args, train_loader, model, optimizer, epoch):
         "warmup_epochs": args.warmup_epochs,
     }
 
-    batch_time_avg = AvgMeter()
-    data_time_avg = AvgMeter()
-    loss_avg = AvgMeter()
+    if args.mtr_dt is None:
+        args.mtr_dt = {
+            "batch_time_mtr": AvgMeter(),
+            "data_time_mtr": AvgMeter(),
+            "loss_mtr": AvgMeter(),
+            "top1_mtr": AvgMeter(),
+            "top5_mtr": AvgMeter(),
+        }
 
     # switch to train mode
     model.train()
 
     end = time.time()
-    for i, (images, _) in enumerate(train_loader):
+    for i, images in enumerate(train_loader):
         # measure data loading time
-        data_time_avg.update(time.time() - end)
+        args.mtr_dt["data_time_mtr"].update(time.time() - end)
 
         if args.gpu is not None:
             images[0] = images[0].cuda(args.gpu, non_blocking=True)
@@ -284,19 +284,23 @@ def train(args, train_loader, model, optimizer, epoch):
         # reduce if necessary
         if args.multiprocessing_distributed:
             for k in output_dict.keys():
-                if "loss" in k:
-                    output_dict[k] = reduce_tensor_mean(output_dict[k], args.world_size)
-
-        loss_avg.update(output_dict["loss"].cpu().item(), images[0].size(0))
+                if "loss" in k or "top" in k:
+                    output_dict[k] = reduce_tensor_mean(output_dict[k])
+                    args.mtr_dt[f"{k}_mtr"].update(output_dict[k], images[0].shape[0])
 
         # measure elapsed time
-        batch_time_avg.update(time.time() - end)
+        args.mtr_dt["batch_time_mtr"].update(time.time() - end)
         end = time.time()
 
         if i % args.print_freq == 0 and args.rank == 0:
-            print(f"[{args.epoch + 1}/{args.total_epochs}], [{i+1}/{len(train_loader)}], "
-                  f"eta: {cal_eta_time(batch_time_avg, (args.total_epochs - args.epoch))}, "
-                  f"loss: {loss_avg.avg} ({loss_avg.val}).")
+            eta_time = cal_eta_time(args.mtr_dt["batch_time_mtr"],
+                                    (args.total_epochs - epoch - 1) * len(train_loader) + len(train_loader) - i - 1)
+            print_line = f"epoch: [{epoch + 1}/{args.total_epochs}], iter: [{i+1}/{len(train_loader)}], " \
+                         f"eta: {eta_time}, loss: {args.mtr_dt['loss_mtr'].avg:.2f} ({args.mtr_dt['loss_mtr'].val:.2f})"
+            if "top1" in args.mtr_dt:
+                print_line += f", top1: {args.mtr_dt['top1_mtr'].avg:.2f} ({args.mtr_dt['top1_mtr'].val:.2f})" \
+                              f", top5: {args.mtr_dt['top5_mtr'].avg:.2f} ({args.mtr_dt['top5_mtr'].val:.2f})"
+            print(print_line)
 
 
 if __name__ == "__main__":
