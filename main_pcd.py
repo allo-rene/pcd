@@ -19,13 +19,14 @@ import torch.utils.data.distributed
 import torchvision.datasets as datasets
 
 import pcd
-from pcd import reduce_tensor_mean, AvgMeter, save_checkpoint, adjust_learning_rate, cal_eta_time
+from pcd import reduce_tensor_mean, AvgMeter, save_checkpoint, \
+    adjust_learning_rate, cal_eta_time, setup_logger, synchronize
 
 
 parser = argparse.ArgumentParser(description="PCD Training on ImageNet")
 # data
 parser.add_argument("data", metavar="DIR", help="path to dataset")
-parser.add_argument("-j", "--workers", default=32, type=int, help="number of data loading workers")
+parser.add_argument("-j", "--workers", default=8, type=int, help="number of data loading workers")
 parser.add_argument("-b", "--batch-size", default=1024, type=int, metavar="N", help="mini-batch size (default: 256)")
 
 # model
@@ -50,6 +51,7 @@ parser.add_argument("-p", "--print-freq", default=10, type=int, help="print freq
 # others
 parser.add_argument("--resume", default=None, type=str, metavar="PATH", help="path to latest checkpoint (default: None)")
 parser.add_argument("--seed", default=None, type=int, help="seed for initializing training.")
+parser.add_argument("--output-dir", default=".", type=str, help="output directory")
 
 # distributed
 parser.add_argument("--world-size", default=-1, type=int, help="number of nodes for distributed training")
@@ -108,7 +110,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # suppress printing if not master
     if args.multiprocessing_distributed and args.gpu != 0:
-
         def print_pass(*args):
             pass
 
@@ -118,8 +119,6 @@ def main_worker(gpu, ngpus_per_node, args):
         print("Use GPU: {} for training".format(args.gpu))
 
     if args.distributed:
-        if args.dist_url == "env://" and args.rank == -1:
-            args.rank = int(os.environ["RANK"])
         if args.multiprocessing_distributed:
             # For multiprocessing distributed training, rank needs to be the
             # global rank among all the processes
@@ -130,6 +129,13 @@ def main_worker(gpu, ngpus_per_node, args):
             world_size=args.world_size,
             rank=args.rank,
         )
+
+    if args.rank == 0:
+        os.makedirs(args.output_dir, exist_ok=True)
+        logger = setup_logger(args.output_dir, args.gpu, filename="train_log.txt")
+    else:
+        logger = None
+    synchronize()
 
     # data
     traindir = os.path.join(args.data, "train")
@@ -150,6 +156,9 @@ def main_worker(gpu, ngpus_per_node, args):
         drop_last=True,
     )
 
+    if args.rank == 0:
+        logger.info(f"Data is ready.")
+
     # model
     student, student_feat_dim = pcd.build_student_backbone(args.student_arch, flatten=False)
     teacher, student_mlp, output_dim = pcd.build_teacher_model(args.teacher_arch, args.teacher_ckpt, student_feat_dim, flatten=False)
@@ -158,7 +167,10 @@ def main_worker(gpu, ngpus_per_node, args):
         student_mlp
     )
     model = pcd.PCD(student, teacher, output_dim, args.queue_size, args.temperature)
-    print(model)
+
+    if args.rank == 0:
+        logger.info(model)
+        logger.info(f"Model is ready.")
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -200,11 +212,14 @@ def main_worker(gpu, ngpus_per_node, args):
     }
     student_model = model.student if not args.multiprocessing_distributed else model.module.student
     optimizer = pcd.build_optimizer(student_model, args.optimizer, **optimizer_kwargs)
+    if args.rank == 0:
+        logger.info(f"Optimizer is ready.")
 
     # resume
     if args.resume is not None:
         if os.path.isfile(args.resume):
-            print(f"=> loading checkpoint '{args.resume}'")
+            if args.rank == 0:
+                logger.info(f"=> loading checkpoint '{args.resume}'")
             if args.gpu is None:
                 checkpoint = torch.load(args.resume)
             else:
@@ -214,18 +229,22 @@ def main_worker(gpu, ngpus_per_node, args):
             args.start_epoch = checkpoint["epoch"]
             model.load_state_dict(checkpoint["state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer"])
-            print(f"=> loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']})")
+            if args.rank == 0:
+                logger.info(f"=> loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']})")
         else:
-            print(f"=> no checkpoint found at '{args.resume}'")
+            if args.rank == 0:
+                logger.info(f"=> no checkpoint found at '{args.resume}'")
 
     # training
     args.mtr_dt = None  # dict for storing AvgMeter
+    if args.rank == 0:
+        logger.info(f"Start training.")
     for epoch in range(args.start_epoch, args.total_epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(args, train_loader, model, optimizer, epoch)
+        train(args, train_loader, model, optimizer, epoch, logger)
 
         # save
         if not args.multiprocessing_distributed or (
@@ -240,9 +259,11 @@ def main_worker(gpu, ngpus_per_node, args):
                 is_best=False,
                 filename="checkpoint_{:04d}.pth.tar".format(epoch),
             )
+    if args.rank == 0:
+        logger.info(f"Training is done.")
 
 
-def train(args, train_loader, model, optimizer, epoch):
+def train(args, train_loader, model, optimizer, epoch, logger):
     lr_decay_kwargs = {
         "lr": args.base_lr,
         "total_epochs": args.total_epochs,
@@ -300,7 +321,7 @@ def train(args, train_loader, model, optimizer, epoch):
             if "top1" in args.mtr_dt:
                 print_line += f", top1: {args.mtr_dt['top1_mtr'].avg:.2f} ({args.mtr_dt['top1_mtr'].val:.2f})" \
                               f", top5: {args.mtr_dt['top5_mtr'].avg:.2f} ({args.mtr_dt['top5_mtr'].val:.2f})"
-            print(print_line)
+            logger.info(print_line)
 
 
 if __name__ == "__main__":

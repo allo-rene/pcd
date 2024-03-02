@@ -1,5 +1,7 @@
+import os
 import math
 import shutil
+from loguru import logger
 
 import torch
 import torch.distributed as dist
@@ -95,3 +97,36 @@ def cal_eta_time(iter_time_mtr, left_iters):
     t_d, t_h = divmod(t_h, 24)
     eta = f"{t_d}d.{t_h:}h.{t_m}m"
     return eta
+
+
+def setup_logger(save_dir, distributed_rank=0, filename="log.txt", mode="a"):
+    """setup logger for training and testing.
+    Args:
+        save_dir(str): location to save log file
+        distributed_rank(int): device rank when multi-gpu environment
+        mode(str): log file write mode, `append` or `override`. default is `a`.
+    Return:
+        logger instance.
+    """
+    save_file = os.path.join(save_dir, filename)
+    if mode == "o" and os.path.exists(save_file):
+        os.remove(save_file)
+    if distributed_rank > 0:
+        logger.remove()
+    logger.add(
+        save_file, format="{time:YYYY-MM-DD at HH:mm} | {level} | {message}",
+        filter="", level="INFO", enqueue=True
+    )
+    return logger
+
+
+def synchronize():
+    """Helper function to synchronize (barrier) among all processes when using distributed training"""
+    if not dist.is_available():
+        return
+    if not dist.is_initialized():
+        return
+    current_world_size = dist.get_world_size()
+    if current_world_size == 1:
+        return
+    dist.barrier()
